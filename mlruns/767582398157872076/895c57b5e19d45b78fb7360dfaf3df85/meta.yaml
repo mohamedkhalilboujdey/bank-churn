@@ -1,0 +1,16 @@
+artifact_uri: file:///C:/Users/boujd/Desktop/bank_churn/mlruns/767582398157872076/895c57b5e19d45b78fb7360dfaf3df85/artifacts
+deleted_time: 1764946153920
+end_time: 1764943478577
+entry_point_name: ''
+experiment_id: '767582398157872076'
+lifecycle_stage: deleted
+run_id: 895c57b5e19d45b78fb7360dfaf3df85
+run_name: random-forest-v1
+run_uuid: 895c57b5e19d45b78fb7360dfaf3df85
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764943470505
+status: 4
+tags: []
+user_id: boujd
