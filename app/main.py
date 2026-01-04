@@ -1,27 +1,39 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from typing import List
 import joblib
 import numpy as np
-from typing import List
 import logging
 import os
+import traceback
 
+from opencensus.ext.azure.log_exporter import AzureLogHandler
 from app.models import CustomerFeatures, PredictionResponse, HealthResponse
+from app.drift_detect import detect_drift
 
-# Configuration du logging
+# -------------------------------------------------
+# Logging & Application Insights
+# -------------------------------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("bank-churn-api")
 
+APPINSIGHTS_CONN = os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING")
+if APPINSIGHTS_CONN:
+    logger.addHandler(AzureLogHandler(connection_string=APPINSIGHTS_CONN))
+    logger.info("Application Insights connecté")
+else:
+    logger.warning("Application Insights non configuré")
+
+# -------------------------------------------------
 # Initialisation FastAPI
+# -------------------------------------------------
 app = FastAPI(
     title="Bank Churn Prediction API",
-    description="API de prediction de defaillance client",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
 
-# CORS pour permettre les requetes depuis un navigateur
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,63 +42,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Chargement du modele au demarrage
+# -------------------------------------------------
+# Chargement du modèle
+# -------------------------------------------------
 MODEL_PATH = os.getenv("MODEL_PATH", "model/churn_model.pkl")
 model = None
 
 @app.on_event("startup")
 async def load_model():
-    """Charge le modele au demarrage de l'API"""
     global model
     try:
         model = joblib.load(MODEL_PATH)
-        logger.info(f"Modele charge avec succes depuis {MODEL_PATH}")
+        logger.info(f"Modèle chargé depuis {MODEL_PATH}")
     except Exception as e:
-        logger.error(f"Erreur lors du chargement du modele : {e}")
+        logger.error(f"Erreur chargement modèle : {e}")
         model = None
 
-@app.get("/", tags=["General"])
-def root():
-    """Endpoint racine"""
-    return {
-        "message": "Bank Churn Prediction API",
-        "version": "1.0.0",
-        "status": "running",
-        "docs": "/docs"
-    }
-
-@app.get("/health", response_model=HealthResponse, tags=["General"])
-def health_check():
-    """Verification de l'etat de l'API"""
+# -------------------------------------------------
+# Endpoints généraux
+# -------------------------------------------------
+@app.get("/health", response_model=HealthResponse)
+def health():
     if model is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="Modele non charge"
-        )
-    return {
-        "status": "healthy",
-        "model_loaded": True
-    }
+        raise HTTPException(status_code=503, detail="Modèle non chargé")
+    return {"status": "healthy", "model_loaded": True}
 
-@app.post("/predict", response_model=PredictionResponse, tags=["Prediction"])
+# -------------------------------------------------
+# Prédiction
+# -------------------------------------------------
+@app.post("/predict", response_model=PredictionResponse)
 def predict(features: CustomerFeatures):
-    """
-    Predit si un client va partir (churn)
-    
-    Retourne :
-    - churn_probability : probabilite de churn (0 a 1)
-    - prediction : 0 (reste) ou 1 (part)
-    - risk_level : Low, Medium ou High
-    """
     if model is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="Modele non disponible"
-        )
-    
+        raise HTTPException(status_code=503, detail="Modèle indisponible")
+
     try:
-        # Preparation des features
-        input_data = np.array([[
+        X = np.array([[ 
             features.CreditScore,
             features.Age,
             features.Tenure,
@@ -98,72 +88,68 @@ def predict(features: CustomerFeatures):
             features.Geography_Germany,
             features.Geography_Spain
         ]])
-        
-        # Prediction
-        proba = model.predict_proba(input_data)[0, 1]
+
+        proba = model.predict_proba(X)[0][1]
         prediction = int(proba > 0.5)
-        
-        # Classification du risque
-        if proba < 0.3:
-            risk = "Low"
-        elif proba < 0.7:
-            risk = "Medium"
-        else:
-            risk = "High"
-        
+
+        risk = "Low" if proba < 0.3 else "Medium" if proba < 0.7 else "High"
+
         logger.info(
-            f"Prediction effectuee : proba={proba:.4f}, "
-            f"prediction={prediction}, risk={risk}"
+            "prediction",
+            extra={
+                "custom_dimensions": {
+                    "event_type": "prediction",
+                    "probability": float(proba),
+                    "risk_level": risk
+                }
+            }
         )
-        
+
         return {
             "churn_probability": round(float(proba), 4),
             "prediction": prediction,
             "risk_level": risk
         }
-    
-    except Exception as e:
-        logger.error(f"Erreur lors de la prediction : {e}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Erreur de prediction : {str(e)}"
-        )
 
-@app.post("/predict/batch", tags=["Prediction"])
-def predict_batch(features_list: List[CustomerFeatures]):
-    """
-    Predictions en batch pour plusieurs clients
-    """
-    if model is None:
-        raise HTTPException(status_code=503, detail="Modele non disponible")
-    
-    try:
-        predictions = []
-        
-        for features in features_list:
-            input_data = np.array([[
-                features.CreditScore, features.Age, features.Tenure,
-                features.Balance, features.NumOfProducts, features.HasCrCard,
-                features.IsActiveMember, features.EstimatedSalary,
-                features.Geography_Germany, features.Geography_Spain
-            ]])
-            
-            proba = model.predict_proba(input_data)[0, 1]
-            prediction = int(proba > 0.5)
-            
-            predictions.append({
-                "churn_probability": round(float(proba), 4),
-                "prediction": prediction
-            })
-        
-        logger.info(f"Batch prediction : {len(predictions)} clients traites")
-        
-        return {"predictions": predictions, "count": len(predictions)}
-    
     except Exception as e:
-        logger.error(f"Erreur batch prediction : {e}")
+        logger.error(f"Erreur prediction : {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# -------------------------------------------------
+# Drift Detection (API)
+# -------------------------------------------------
+@app.post("/drift/check", tags=["Monitoring"])
+def check_drift(threshold: float = 0.05):
+    try:
+        results = detect_drift(
+            reference_file="data/bank_churn.csv",
+            production_file="data/production_data.csv",
+            threshold=threshold
+        )
+
+        drifted = [f for f, r in results.items() if r["drift_detected"]]
+        drift_pct = len(drifted) / len(results) * 100
+
+        logger.info(
+            "drift_detection",
+            extra={
+                "custom_dimensions": {
+                    "event_type": "drift_detection",
+                    "features_analyzed": len(results),
+                    "features_drifted": len(drifted),
+                    "drift_percentage": drift_pct,
+                    "risk_level": "HIGH" if drift_pct > 50 else "MEDIUM" if drift_pct > 20 else "LOW"
+                }
+            }
+        )
+
+        return {
+            "status": "success",
+            "features_analyzed": len(results),
+            "features_drifted": len(drifted)
+        }
+
+    except Exception:
+        tb = traceback.format_exc()
+        logger.error(tb)
+        raise HTTPException(status_code=500, detail="Erreur drift detection")
